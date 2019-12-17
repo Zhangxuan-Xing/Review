@@ -2,17 +2,12 @@
 
 * [一、思想目标](#一思想目标)
 
-* [二、路由中心 NameServer](#二路由中心 NameServer)
+* [二、路由中心NameServer](#二路由中心NameServer)
 
-* [三、数据类型](#三数据类型)
-
-* [四、数据结构](#四数据结构)
-
-* [五、基础应用](#五基础应用)
-
-* [六、Redis 与 Memcached](#六redis-与-memcached)
+* [三、消息发送](#三消息发送)
 
   <!-- GFM-TOC -->
+
 
 
 
@@ -66,7 +61,7 @@
 
 ---
 
-## 二、路由中心 NameServer
+## 二、路由中心NameServer
 
 ### 1.架构设计
 
@@ -238,6 +233,443 @@ public class RouteInfoManager {
 
 ​	通过Broker和NameServer的**心跳功能实现**，Broker启动时向集群中所有NameServer发送心跳语句，**每隔30s**向所有NameServer发送心跳包，NameServer收到心跳包会更新BrokerLiveInfo的lastUpateTimestamp，NameServer**每隔10s**扫描brokerLiveTable，如果**连续120s**没有收到心跳包，则移除该Broker的路由信息并关闭Socket连接。
 
+![路由注册.jpg](https://segmentfault.com/img/bVbzHjJ?w=697&h=391)
+
 ##### 3.2.1 发送心跳包
 
-​	待写
+​	遍历NameServer列表，Broker消息服务器依次向NameServer发送心跳包。
+
+```java
+this.scheduledExecutorService.scheduleAtFixedRate(new Runnable() {
+
+    @Override
+    public void run() {
+        try {
+            BrokerController.this.registerBrokerAll(true, false, brokerConfig.isForceRegister());
+        } catch (Throwable e) {
+            log.error("registerBrokerAll Exception", e);
+        }
+    }
+}, 1000 * 10, Math.max(10000, Math.min(brokerConfig.getRegisterNameServerPeriod(), 60000)), TimeUnit.MILLISECONDS);
+
+// registerBrokerAll 方法如下
+    public List<RegisterBrokerResult> registerBrokerAll(
+        final String clusterName,
+        final String brokerAddr,
+        final String brokerName,
+        final long brokerId,
+        final String haServerAddr,
+        final TopicConfigSerializeWrapper topicConfigWrapper,
+        final List<String> filterServerList,
+        final boolean oneway,
+        final int timeoutMills,
+        final boolean compressed) {
+
+        final List<RegisterBrokerResult> registerBrokerResultList = Lists.newArrayList();
+        List<String> nameServerAddressList = this.remotingClient.getNameServerAddressList();
+        if (nameServerAddressList != null && nameServerAddressList.size() > 0) {
+
+            final RegisterBrokerRequestHeader requestHeader = new RegisterBrokerRequestHeader();
+            requestHeader.setBrokerAddr(brokerAddr);
+            requestHeader.setBrokerId(brokerId);
+            requestHeader.setBrokerName(brokerName);
+            requestHeader.setClusterName(clusterName);
+            // master地址，初次请求为空，slave向NameServer注册后返回
+            requestHeader.setHaServerAddr(haServerAddr);
+            requestHeader.setCompressed(compressed);
+
+            RegisterBrokerBody requestBody = new RegisterBrokerBody();
+            requestBody.setTopicConfigSerializeWrapper(topicConfigWrapper);
+            // 设置消息过滤服务器列表
+            requestBody.setFilterServerList(filterServerList);
+            final byte[] body = requestBody.encode(compressed);
+            final int bodyCrc32 = UtilAll.crc32(body);
+            requestHeader.setBodyCrc32(bodyCrc32);
+            final CountDownLatch countDownLatch = new CountDownLatch(nameServerAddressList.size());
+            // 遍历所有NameServer列表
+            for (final String namesrvAddr : nameServerAddressList) {
+                brokerOuterExecutor.execute(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            // 分别向NameServer注册
+                            RegisterBrokerResult result = registerBroker(namesrvAddr,oneway, timeoutMills,requestHeader,body);
+                            if (result != null) {
+                                registerBrokerResultList.add(result);
+                            }
+
+                            log.info("register broker[{}]to name server {} OK", brokerId, namesrvAddr);
+                        } catch (Exception e) {
+                            log.warn("registerBroker Exception, {}", namesrvAddr, e);
+                        } finally {
+                            countDownLatch.countDown();
+                        }
+                    }
+                });
+            }
+
+            try {
+                countDownLatch.await(timeoutMills, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+            }
+        }
+
+        return registerBrokerResultList;
+    }
+
+// registerBroker 方法如下
+    private RegisterBrokerResult registerBroker(
+        final String namesrvAddr,
+        final boolean oneway,
+        final int timeoutMills,
+        final RegisterBrokerRequestHeader requestHeader,
+        final byte[] body
+    ) throws RemotingCommandException, MQBrokerException, RemotingConnectException, RemotingSendRequestException, RemotingTimeoutException,
+        InterruptedException {
+        RemotingCommand request = RemotingCommand.createRequestCommand(RequestCode.REGISTER_BROKER, requestHeader);
+        request.setBody(body);
+ 	
+        if (oneway) {
+            try {
+                this.remotingClient.invokeOneway(namesrvAddr, request, timeoutMills);
+            } catch (RemotingTooMuchRequestException e) {
+                // Ignore
+            }
+            return null;
+        }
+
+        RemotingCommand response = this.remotingClient.invokeSync(namesrvAddr, request, timeoutMills);
+        assert response != null;
+        switch (response.getCode()) {
+            case ResponseCode.SUCCESS: {
+                RegisterBrokerResponseHeader responseHeader =
+                    (RegisterBrokerResponseHeader) response.decodeCommandCustomHeader(RegisterBrokerResponseHeader.class);
+                RegisterBrokerResult result = new RegisterBrokerResult();
+                result.setMasterAddr(responseHeader.getMasterAddr());
+                result.setHaServerAddr(responseHeader.getHaServerAddr());
+                if (response.getBody() != null) {
+                    result.setKvTable(KVTable.decode(response.getBody(), KVTable.class));
+                }
+                return result;
+            }
+            default:
+                break;
+        }
+
+        throw new MQBrokerException(response.getCode(), response.getRemark());
+    }
+```
+
+##### 3.2.2 处理心跳包
+
+① 加写锁
+
+```java
+// 路由注册需加写锁，防止并发修改路由表
+this.lock.writeLock().lockInterruptibly();
+
+// 判断Broker所属集群是否存在，如不存在则进行创建，并把brokerName加入其中
+Set<String> brokerNames = this.clusterAddrTable.get(clusterName);
+if (null == brokerNames) {
+    brokerNames = new HashSet<String>();
+    this.clusterAddrTable.put(clusterName, brokerNames);
+}
+brokerNames.add(brokerName);
+```
+
+② 维护BrokerData信息
+
+```java
+// 根据brokerName获取Broker信息，如不存在就创建并添加至table
+BrokerData brokerData = this.brokerAddrTable.get(brokerName);
+if (null == brokerData) {
+    registerFirst = true;
+    brokerData = new BrokerData(clusterName, brokerName, new HashMap<Long, String>());
+    this.brokerAddrTable.put(brokerName, brokerData);
+}
+Map<Long, String> brokerAddrsMap = brokerData.getBrokerAddrs();
+//Switch slave to master: first remove <1, IP:PORT> in namesrv, then add <0, IP:PORT>
+//The same IP:PORT must only have one record in brokerAddrTable
+// 移除当前brokerAdd为Value的值，因为地址+端口不能重复
+Iterator<Entry<Long, String>> it = brokerAddrsMap.entrySet().iterator();
+while (it.hasNext()) {
+    Entry<Long, String> item = it.next();
+    if (null != brokerAddr && brokerAddr.equals(item.getValue()) && brokerId != item.getKey()) {
+        it.remove();
+    }
+}
+
+String oldAddr = brokerData.getBrokerAddrs().put(brokerId, brokerAddr);
+// 判断是否首次创建，非第一次创建为false
+registerFirst = registerFirst || (null == oldAddr);
+```
+
+③ 更新信息
+
+```java
+if (null != topicConfigWrapper
+    && MixAll.MASTER_ID == brokerId) {
+    // 如果Broker为Master且配置信息发生变化或首次注册
+    if (this.isBrokerTopicConfigChanged(brokerAddr, topicConfigWrapper.getDataVersion())
+        || registerFirst) {
+        ConcurrentMap<String, TopicConfig> tcTable =
+            topicConfigWrapper.getTopicConfigTable();
+        if (tcTable != null) {
+        // 更新信息
+            for (Map.Entry<String, TopicConfig> entry : tcTable.entrySet()) {
+                this.createAndUpdateQueueData(brokerName, entry.getValue());
+            }
+        }
+    }
+}
+```
+
+④ 根据topicConfig创建QueueData，更新topicQueueTable
+
+```java
+private void createAndUpdateQueueData(final String brokerName, final TopicConfig topicConfig) {
+    QueueData queueData = new QueueData();
+    queueData.setBrokerName(brokerName);
+    queueData.setWriteQueueNums(topicConfig.getWriteQueueNums());
+    queueData.setReadQueueNums(topicConfig.getReadQueueNums());
+    queueData.setPerm(topicConfig.getPerm());
+    queueData.setTopicSynFlag(topicConfig.getTopicSysFlag());
+
+    List<QueueData> queueDataList = this.topicQueueTable.get(topicConfig.getTopicName());
+    if (null == queueDataList) {
+        queueDataList = new LinkedList<QueueData>();
+        queueDataList.add(queueData);
+        this.topicQueueTable.put(topicConfig.getTopicName(), queueDataList);
+        log.info("new topic registered, {} {}", topicConfig.getTopicName(), queueData);
+    } else {
+        boolean addNewOne = true;
+
+        Iterator<QueueData> it = queueDataList.iterator();
+        while (it.hasNext()) {
+            QueueData qd = it.next();
+            if (qd.getBrokerName().equals(brokerName)) {
+                if (qd.equals(queueData)) {
+                    addNewOne = false;
+                } else {
+                    log.info("topic changed, {} OLD: {} NEW: {}", topicConfig.getTopicName(), qd,
+                        queueData);
+                    it.remove();
+                }
+            }
+        }
+
+        if (addNewOne) {
+            queueDataList.add(queueData);
+        }
+    }
+}
+```
+
+⑤ 更新BrokerLiveInfo
+
+```java
+BrokerLiveInfo prevBrokerLiveInfo = this.brokerLiveTable.put(brokerAddr,
+    new BrokerLiveInfo(
+        System.currentTimeMillis(),
+        topicConfigWrapper.getDataVersion(),
+        channel,
+        haServerAddr));
+if (null == prevBrokerLiveInfo) {
+    log.info("new broker registered, {} HAServer: {}", brokerAddr, haServerAddr);
+}
+```
+
+⑥ 注册Broker的过滤Server地址列表
+
+```java
+if (filterServerList != null) {
+    if (filterServerList.isEmpty()) {
+        this.filterServerTable.remove(brokerAddr);
+    } else {
+        // 一个broker会关联多个filterServer消息过滤服务器
+        this.filterServerTable.put(brokerAddr, filterServerList);
+    }
+}
+
+if (MixAll.MASTER_ID != brokerId) {
+    String masterAddr = brokerData.getBrokerAddrs().get(MixAll.MASTER_ID);
+    if (masterAddr != null) {
+        BrokerLiveInfo brokerLiveInfo = this.brokerLiveTable.get(masterAddr);
+        // 找到master节点信息并更新masterAddr属性
+        if (brokerLiveInfo != null) {
+            result.setHaServerAddr(brokerLiveInfo.getHaServerAddr());
+            result.setMasterAddr(masterAddr);
+        }
+    }
+}
+```
+
+#### 3.3 路由删除
+
+- 正常情况：broker正常关闭，执行unregisterBroker指令；
+- 非正常情况：每隔10s调用scanNotActiveBroker检测lastUpdateTimestamp上次心跳包和当前系统时间的时间差，大于120s就移除该broker，关闭与broker的连接，并同时更新topicQueueTable、brokerAddrTable、brokerLiveTable、filterServerTable。
+
+```java
+    /**
+     * 在NameServer中每10s执行一次
+     */
+    public void scanNotActiveBroker() {
+        Iterator<Entry<String, BrokerLiveInfo>> it = this.brokerLiveTable.entrySet().iterator();
+        // 遍历brokerLiveInfo路由表
+        while (it.hasNext()) {
+            Entry<String, BrokerLiveInfo> next = it.next();
+            long last = next.getValue().getLastUpdateTimestamp();
+            // 判断时间差是否大于120s
+            if ((last + BROKER_CHANNEL_EXPIRED_TIME) < System.currentTimeMillis()) {
+                // 关闭连接
+                RemotingUtil.closeChannel(next.getValue().getChannel());
+                // 移除
+                it.remove();
+                log.warn("The broker channel expired, {} {}ms", next.getKey(), BROKER_CHANNEL_EXPIRED_TIME);
+                // 删除相关路由信息 - 该方法需要申请写锁
+                this.onChannelDestroy(next.getKey(), next.getValue().getChannel());
+            }
+        }
+    }
+```
+
+①  申请写锁并维护brokerAddrTable
+
+```java
+// 申请写锁，根据brokerAddr从brokerLiveTable、filterServerTable移除
+this.lock.writeLock().lockInterruptibly();
+this.brokerLiveTable.remove(brokerAddrFound);
+this.filterServerTable.remove(brokerAddrFound);
+String brokerNameFound = null;
+boolean removeBrokerName = false;
+Iterator<Entry<String, BrokerData>> itBrokerAddrTable =
+    this.brokerAddrTable.entrySet().iterator();
+while (itBrokerAddrTable.hasNext() && (null == brokerNameFound)) {
+    BrokerData brokerData = itBrokerAddrTable.next().getValue();
+
+    Iterator<Entry<Long, String>> it = brokerData.getBrokerAddrs().entrySet().iterator();
+    while (it.hasNext()) {
+        Entry<Long, String> entry = it.next();
+        Long brokerId = entry.getKey();
+        String brokerAddr = entry.getValue();
+        if (brokerAddr.equals(brokerAddrFound)) {
+            brokerNameFound = brokerData.getBrokerName();
+            it.remove();
+            log.info("remove brokerAddr[{}, {}] from brokerAddrTable, because channel destroyed",
+                brokerId, brokerAddr);
+            break;
+        }
+    }
+
+    // 移除broker后如不再包含其他broker，则在brokerAddrTable中移除对应条目
+    if (brokerData.getBrokerAddrs().isEmpty()) {
+        removeBrokerName = true;
+        itBrokerAddrTable.remove();
+        log.info("remove brokerName[{}] from brokerAddrTable, because channel destroyed",
+            brokerData.getBrokerName());
+    }
+}
+
+if (brokerNameFound != null && removeBrokerName) {
+    Iterator<Entry<String, Set<String>>> it = this.clusterAddrTable.entrySet().iterator();
+    while (it.hasNext()) {
+        Entry<String, Set<String>> entry = it.next();
+        String clusterName = entry.getKey();
+        Set<String> brokerNames = entry.getValue();
+        // 从集群中移除
+        boolean removed = brokerNames.remove(brokerNameFound);
+        if (removed) {
+            log.info("remove brokerName[{}], clusterName[{}] from clusterAddrTable, because channel destroyed",
+                brokerNameFound, clusterName);
+            
+            // 如移除后集群不包含broker，则将该集群移除
+            if (brokerNames.isEmpty()) {
+                log.info("remove the clusterName[{}] from clusterAddrTable, because channel destroyed and no broker in this cluster",
+                    clusterName);
+                it.remove();
+            }
+
+            break;
+        }
+    }
+}
+```
+
+② 根据brokerName遍历主题队列
+
+```java
+if (removeBrokerName) {
+    Iterator<Entry<String, List<QueueData>>> itTopicQueueTable =
+        this.topicQueueTable.entrySet().iterator();
+    while (itTopicQueueTable.hasNext()) {
+        Entry<String, List<QueueData>> entry = itTopicQueueTable.next();
+        String topic = entry.getKey();
+        List<QueueData> queueDataList = entry.getValue();
+
+        Iterator<QueueData> itQueueData = queueDataList.iterator();
+        while (itQueueData.hasNext()) {
+            QueueData queueData = itQueueData.next();
+            if (queueData.getBrokerName().equals(brokerNameFound)) {
+                itQueueData.remove();
+                log.info("remove topic[{} {}], from topicQueueTable, because channel destroyed",
+                    topic, queueData);
+            }
+        }
+
+        if (queueDataList.isEmpty()) {
+            itTopicQueueTable.remove();
+            log.info("remove topic[{}] all queue, from topicQueueTable, because channel destroyed",
+                topic);
+        }
+    }
+}
+```
+
+③ 释放锁
+
+```java
+finally {
+    this.lock.writeLock().unlock();
+}
+```
+
+#### 3.4 路由发现
+
+​	路由发现并不是实时的，当topic路由发生变化后，NameServer不主动推送给客户端，而是由客户端定时拉取最新路由。
+
+```java
+public RemotingCommand getRouteInfoByTopic(ChannelHandlerContext ctx,
+    RemotingCommand request) throws RemotingCommandException {
+    final RemotingCommand response = RemotingCommand.createResponseCommand(null);
+    final GetRouteInfoRequestHeader requestHeader =
+        (GetRouteInfoRequestHeader) request.decodeCommandCustomHeader(GetRouteInfoRequestHeader.class);
+
+    // 填充 TopicRouteData
+    TopicRouteData topicRouteData = this.namesrvController.getRouteInfoManager().pickupTopicRouteData(requestHeader.getTopic());
+
+    if (topicRouteData != null) {
+        // 如果为顺序消息，则从KVConfig中获取关于顺序消息的配置填充路由信息
+        if (this.namesrvController.getNamesrvConfig().isOrderMessageEnable()) {
+            String orderTopicConf =
+                this.namesrvController.getKvConfigManager().getKVConfig(NamesrvUtil.NAMESPACE_ORDER_TOPIC_CONFIG,
+                    requestHeader.getTopic());
+            topicRouteData.setOrderTopicConf(orderTopicConf);
+        }
+
+        byte[] content = topicRouteData.encode();
+        response.setBody(content);
+        response.setCode(ResponseCode.SUCCESS);
+        response.setRemark(null);
+        return response;
+    }
+
+    response.setCode(ResponseCode.TOPIC_NOT_EXIST);
+    response.setRemark("No topic route info in name server for the topic: " + requestHeader.getTopic()
+        + FAQUrl.suggestTodo(FAQUrl.APPLY_TOPIC_URL));
+    return response;
+}
+```
+
+---
+
+## 三、消息发送
