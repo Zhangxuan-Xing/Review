@@ -671,5 +671,3 @@ public RemotingCommand getRouteInfoByTopic(ChannelHandlerContext ctx,
 ```
 
 ---
-
-## 三、消息发送
