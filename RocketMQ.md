@@ -669,5 +669,3 @@ public RemotingCommand getRouteInfoByTopic(ChannelHandlerContext ctx,
     return response;
 }
 ```
-
----
