@@ -11,7 +11,6 @@
 
 ### 2.加载机制
 
-![1596245945394](C:\Users\xuan\AppData\Roaming\Typora\typora-user-images\1596245945394.png)
 
 ​	顶层类加载和JVM一致，CommonClassLoader、CatalinaClassLoader、SharedClassLoader和WebappClassLoader则是Tomcat自定义的类加载器，它们分别加载 /common/*、/server/*、/shared/*（在tomcat 6之后已经合并到根目录下的lib目录下）和 /WebApp/WEB-INF/* 中的Java类库。其中WebApp类加载器和Jsp类加载器通常会存在多个实例，每一个Web应用程序对应一个WebApp类加载器，每一个JSP文件对应一个Jsp类加载器。
 
