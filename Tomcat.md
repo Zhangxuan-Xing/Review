@@ -55,7 +55,6 @@
 
 #### 3.4 JVM类关系
 
-![1596247985542](C:\Users\xuan\AppData\Roaming\Typora\typora-user-images\1596247985542.png)
 
 ​	由图看到Bootstrap ClassLoader并不在继承链上，因为它是虚拟机内置的类加载器，对外不可见。可以看到顶层`ClassLoader`有一个parent属性，用来表示着类加载器之间的层次关系（双亲委派模型）；注意，`ExtClassLoader`类在初始化时显式指定了parent为null，所以它的父类加载器默认为`Bootstrap ClassLoader`。在tomcat中都是通过扩展`URLClassLoader`来实现自己的类加载器。
 
