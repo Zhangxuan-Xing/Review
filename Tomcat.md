@@ -83,7 +83,6 @@ loader = AppClassLoader.getAppClassLoader(extcl);//loader是ClassLoader的属性
 
 > 在JVM中并不是一次性把所有的文件都加载到，而是一步一步的，按照需要进行加载，比如JVM启动时，会通过不同的类加载器加载不同的类。
 
-![1596246628552](C:\Users\xuan\AppData\Roaming\Typora\typora-user-images\1596246628552.png)
 
 **类加载步骤如下**：
 
